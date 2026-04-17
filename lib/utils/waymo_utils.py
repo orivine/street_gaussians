@@ -164,7 +164,7 @@ def get_obj_pose_tracking(datadir, selected_frames, ego_poses, cameras=[0, 1, 2,
             objects_info[track_id]['length'] = max(objects_info[track_id]['length'], float(tracklet[6]))
             
         tr_array = np.concatenate(
-            [np.array(tracklet[:2]).astype(np.float64), np.array([type]), np.array(tracklet[4:]).astype(np.float64)]
+            [np.array(tracklet[:2]).astype(np.float64), np.array([waymo_track2label[object_class]]), np.array(tracklet[4:]).astype(np.float64)]
         )
         tracklets_ls.append(tr_array)
         n_obj_in_frame[frame_id] += 1

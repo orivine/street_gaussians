@@ -109,12 +109,21 @@ def run_colmap_waymo(result):
             cv2.imwrite(new_mask_filename, flip_mask)
     
     # https://colmap.github.io/faq.html#mask-image-regions
-    os.system(f'colmap feature_extractor \
+    # Limit CPU SIFT extraction threads to prevent OOM crash on high-core-count servers.
+    # With 1920x1280 images and default first_octave=-1, each thread consumes ~600-800MB RAM.
+    # 32 threads => ~25GB peak, well within the 239GB available on this machine.
+    # Raise this value if the server has more cores and you want faster extraction,
+    # but keep num_threads * ~800MB well below available RAM.
+    feature_ret = os.system(f'colmap feature_extractor \
+            --SiftExtraction.use_gpu 0 \
+            --SiftExtraction.num_threads 128 \
             --ImageReader.mask_path {mask_images_dir} \
             --ImageReader.camera_model SIMPLE_PINHOLE  \
             --ImageReader.single_camera_per_folder 1 \
             --database_path {colmap_dir}/database.db \
             --image_path {train_images_dir}')
+    if feature_ret != 0:
+        raise RuntimeError('COLMAP feature_extractor failed. Check disk space, image paths, and COLMAP installation.')
 
     # load intrinsic
     camera_infos = dict()
@@ -256,12 +265,26 @@ def run_colmap_waymo(result):
     with open(rigid_config_path, "w+") as f:
         json.dump([cam_rigid], f, indent=4)   
 
-    os.system(f'colmap exhaustive_matcher \
+    matcher_ret = os.system(f'colmap exhaustive_matcher \
+            --SiftMatching.use_gpu 0 \
+            --SiftMatching.num_threads 128 \
+            --ExhaustiveMatching.block_size 5 \
             --database_path {colmap_dir}/database.db')
+    if matcher_ret != 0:
+        raise RuntimeError('COLMAP exhaustive_matcher failed. Reduce threads/block size or check system memory.')
+
+    db = f'{colmap_dir}/database.db'
+    conn = sqlite3.connect(db)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM two_view_geometries')
+    num_two_view = c.fetchone()[0]
+    conn.close()
+    if num_two_view == 0:
+        raise RuntimeError('COLMAP produced 0 verified image pairs (two_view_geometries). Triangulation would fail. Try lower --SiftMatching.num_threads and --ExhaustiveMatching.block_size, and rerun.')
 
     triangulated_dir = os.path.join(colmap_dir, 'triangulated/sparse/model')
     os.makedirs(triangulated_dir, exist_ok=True)
-    os.system(f'colmap point_triangulator \
+    tri_ret = os.system(f'colmap point_triangulator \
         --database_path {colmap_dir}/database.db \
         --image_path {train_images_dir} \
         --input_path {model_dir} \
@@ -277,6 +300,8 @@ def run_colmap_waymo(result):
         --Mapper.tri_ignore_two_view_tracks 1 \
         --Mapper.tri_complete_max_reproj_error 4 \
         --Mapper.tri_continue_max_angle_error 4')
+    if tri_ret != 0:
+        raise RuntimeError('COLMAP point_triangulator failed. Check matcher output and two_view_geometries count.')
     
     if cfg.data.use_colmap_pose:
         # May lead to unstable results when refining relative poses

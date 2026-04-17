@@ -449,7 +449,7 @@ class StreetGaussianModel(nn.Module):
         return opacities
             
     def get_covariance(self, scaling_modifier = 1):
-        scaling = self.get_scoaling # [N, 1]
+        scaling = self.get_scaling # [N, 1]
         rotation = self.get_rotation # [N, 4]
         L = build_scaling_rotation(scaling_modifier * scaling, rotation)
         actual_covariance = L @ L.transpose(1, 2)
@@ -473,7 +473,7 @@ class StreetGaussianModel(nn.Module):
             obj_rot = quaternion_to_matrix(obj_rot.unsqueeze(0)).squeeze(0)
             
             normals_obj_global = normals_obj_local @ obj_rot.T
-            normals_obj_global = torch.nn.functinal.normalize(normals_obj_global)                
+            normals_obj_global = torch.nn.functional.normalize(normals_obj_global)                
             normals.append(normals_obj_global)
 
         normals = torch.cat(normals, dim=0)
