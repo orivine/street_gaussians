@@ -36,6 +36,33 @@ def l1_loss(network_output, gt, mask=None):
 
     return loss
 
+
+def weighted_l1_loss(network_output, gt, weight_map):
+    '''
+    network_output, gt: (C, H, W)
+    weight_map: (1, H, W) or (H, W)
+    '''
+
+    network_output = network_output.permute(1, 2, 0) # [H, W, C]
+    gt = gt.permute(1, 2, 0) # [H, W, C]
+
+    if weight_map.ndim == 3:
+        weight_map = weight_map.squeeze(0)
+    if weight_map.ndim != 2:
+        raise ValueError(f'Expected weight_map with shape [1, H, W] or [H, W], got {tuple(weight_map.shape)}')
+    if weight_map.shape != network_output.shape[:2]:
+        raise ValueError(
+            f'weight_map shape {tuple(weight_map.shape)} does not match image shape {tuple(network_output.shape[:2])}'
+        )
+
+    abs_error = torch.abs(network_output - gt)
+    weighted_abs_error = abs_error * weight_map.unsqueeze(-1)
+    denom = (weight_map.sum() * abs_error.shape[-1]).clamp_min(1e-6)
+
+    loss = weighted_abs_error.sum() / denom
+    return loss
+
+
 def l2_loss(network_output, gt, mask=None):
     '''
     network_output, gt: (C, H, W)

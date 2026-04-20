@@ -71,8 +71,13 @@ class GaussianModelBkgd(GaussianModel):
         semantic = super().get_semantic
         return semantic if self.background_mask is None else semantic[self.background_mask]
 
-    def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
-        max_grad = cfg.optim.get('densify_grad_threshold_bkgd', max_grad)
+    def densify_and_prune(self, max_grad, min_opacity, prune_big_points, max_grad_override=None, min_opacity_override=None):
+        if max_grad_override is None:
+            max_grad = cfg.optim.get('densify_grad_threshold_bkgd', max_grad)
+        else:
+            max_grad = max_grad_override
+        if min_opacity_override is not None:
+            min_opacity = min_opacity_override
         if cfg.optim.get('densify_grad_abs_bkgd', False):
             grads = self.xyz_gradient_accum[:, 1:2] / self.denom
         else:

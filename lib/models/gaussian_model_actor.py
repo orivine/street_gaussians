@@ -201,9 +201,16 @@ class GaussianModelActor(GaussianModel):
         self.scalar_dict = dict()
         self.tensor_dict = dict()  
             
-    def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
-        if not (self.random_initialization or self.deformable):
+    def densify_and_prune(self, max_grad, min_opacity, prune_big_points, max_grad_override=None, min_opacity_override=None):
+        if max_grad_override is not None:
+            max_grad = max_grad_override
+        elif not (self.random_initialization or self.deformable):
             max_grad = cfg.optim.get('densify_grad_threshold_obj', max_grad)
+
+        if min_opacity_override is not None:
+            min_opacity = min_opacity_override
+
+        if not (self.random_initialization or self.deformable):
             if cfg.optim.get('densify_grad_abs_obj', False):
                 grads = self.xyz_gradient_accum[:, 1:2] / self.denom
             else:

@@ -1,7 +1,17 @@
 import os
 import torch
 from random import randint
-from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim
+from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim, weighted_l1_loss
+from lib.utils.priority_utils import (
+    build_priority_mask,
+    build_camera_priority_scores,
+    build_priority_weight_map,
+    build_priority_sampling_probs,
+    compute_priority_warmup,
+    get_camera_valid_mask,
+    sample_view_index,
+    summarize_priority_mask,
+)
 from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
@@ -21,10 +31,54 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+try:
+    import wandb
+    WANDB_FOUND = True
+except ImportError:
+    WANDB_FOUND = False
+
+
+def _cfg_to_plain_dict(node):
+    if isinstance(node, dict):
+        return {key: _cfg_to_plain_dict(value) for key, value in node.items()}
+    if isinstance(node, (list, tuple)):
+        return [_cfg_to_plain_dict(value) for value in node]
+    return node
+
+
+def prepare_wandb():
+    wandb_cfg = cfg.logging.wandb
+    if not wandb_cfg.enabled:
+        return None
+    if not WANDB_FOUND:
+        print("wandb not available: not logging to wandb")
+        return None
+
+    run_name = wandb_cfg.name if len(wandb_cfg.name) > 0 else f"{cfg.task}-{cfg.exp_name}"
+    entity = wandb_cfg.entity if len(wandb_cfg.entity) > 0 else None
+    tags = list(wandb_cfg.tags)
+
+    try:
+        return wandb.init(
+            project=wandb_cfg.project,
+            entity=entity,
+            name=run_name,
+            tags=tags,
+            mode=wandb_cfg.mode,
+            dir=cfg.record_dir,
+            save_code=wandb_cfg.save_code,
+            sync_tensorboard=wandb_cfg.sync_tensorboard,
+            config=_cfg_to_plain_dict(cfg),
+        )
+    except Exception as exc:
+        print(f"Failed to initialize wandb: {exc}")
+        return None
+
 def training():
     training_args = cfg.train
     optim_args = cfg.optim
     data_args = cfg.data
+    method_args = cfg.method
 
     start_iter = 0
     tb_writer = prepare_output_and_logger()
@@ -60,6 +114,22 @@ def training():
     progress_bar = tqdm(range(start_iter, training_args.iterations))
     start_iter += 1
 
+    train_cameras = scene.getTrainCameras()
+    priority_sampler = None
+    if method_args.sampler.mode == 'priority_mix':
+        priority_sampler = build_camera_priority_scores(
+            cameras=train_cameras,
+            priority_source=method_args.priority.source,
+            priority_dilate=method_args.priority.dilate,
+            score_type=method_args.sampler.score_type,
+        )
+        priority_sampler['probs'] = build_priority_sampling_probs(
+            scores=priority_sampler['scores'],
+            eta=method_args.sampler.eta,
+        )
+    elif method_args.sampler.mode != 'uniform':
+        raise NotImplementedError(f'Sampler mode "{method_args.sampler.mode}" is not implemented yet')
+
     viewpoint_stack = None
     for iteration in range(start_iter, training_args.iterations + 1):
     
@@ -71,13 +141,21 @@ def training():
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        
-        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        selected_view_score = None
+        selected_view_priority_ratio = None
+        if method_args.sampler.mode == 'uniform':
+            if not viewpoint_stack:
+                viewpoint_stack = train_cameras.copy()
+            viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        else:
+            selected_view_idx = sample_view_index(priority_sampler['probs'])
+            viewpoint_cam: Camera = train_cameras[selected_view_idx]
+            selected_view_score = float(priority_sampler['scores'][selected_view_idx].item())
+            selected_view_priority_ratio = float(priority_sampler['priority_ratios'][selected_view_idx].item())
         
         gt_image = viewpoint_cam.original_image
-        mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
+        mask = get_camera_valid_mask(viewpoint_cam)
+        obj_bound = viewpoint_cam.guidance.get('obj_bound')
         gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
         mask = mask.cuda(non_blocking=True) if not mask.is_cuda else mask
         if 'lidar_depth' in viewpoint_cam.guidance:
@@ -86,9 +164,17 @@ def training():
         if 'sky_mask' in viewpoint_cam.guidance:
             sky_mask = viewpoint_cam.guidance['sky_mask']
             sky_mask = sky_mask.cuda(non_blocking=True) if not sky_mask.is_cuda else sky_mask
-        if 'obj_bound' in viewpoint_cam.guidance:
-            obj_bound = viewpoint_cam.guidance['obj_bound']
+        if obj_bound is not None:
             obj_bound = obj_bound.cuda(non_blocking=True) if not obj_bound.is_cuda else obj_bound
+
+        priority_mask = None
+        if method_args.priority.source != 'none' or method_args.photo_loss.mode == 'priority_l1':
+            priority_mask = build_priority_mask(
+                obj_bound=obj_bound,
+                valid_mask=mask,
+                source=method_args.priority.source,
+                dilate=method_args.priority.dilate,
+            )
         
             
         render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
@@ -96,10 +182,43 @@ def training():
         depth = render_pkg['depth'] # [1, H, W]
 
         scalar_dict = dict()
+        if priority_mask is not None:
+            scalar_dict.update(summarize_priority_mask(priority_mask, mask))
+            scalar_dict['priority_source_box'] = 1.0 if method_args.priority.source == 'box' else 0.0
+            scalar_dict['priority_dilate'] = float(method_args.priority.dilate)
+        if method_args.photo_loss.mode == 'priority_l1':
+            scalar_dict['photo_loss_priority_l1'] = 1.0
+        if method_args.sampler.mode == 'priority_mix':
+            scalar_dict['sampler_priority_mix'] = 1.0
+        if selected_view_score is not None:
+            scalar_dict['sampler_eta'] = method_args.sampler.eta
+            scalar_dict['selected_view_score'] = selected_view_score
+            scalar_dict['selected_view_priority_ratio'] = selected_view_priority_ratio
         
         # rgb loss
-        Ll1 = l1_loss(image, gt_image, mask)
-        scalar_dict['l1_loss'] = Ll1.item()
+        if method_args.photo_loss.mode == 'baseline':
+            Ll1 = l1_loss(image, gt_image, mask)
+            scalar_dict['l1_loss'] = Ll1.item()
+        elif method_args.photo_loss.mode == 'priority_l1':
+            priority_warmup = compute_priority_warmup(
+                iteration=iteration,
+                warmup_start=method_args.photo_loss.warmup_start,
+                warmup_end=method_args.photo_loss.warmup_end,
+            )
+            weight_map = build_priority_weight_map(
+                valid_mask=mask,
+                priority_mask=priority_mask,
+                lambda_p=method_args.photo_loss.lambda_p,
+                warmup=priority_warmup,
+            )
+            Ll1 = weighted_l1_loss(image, gt_image, weight_map)
+            scalar_dict['l1_loss'] = Ll1.item()
+            scalar_dict['weighted_l1_loss'] = Ll1.item()
+            scalar_dict['priority_lambda'] = method_args.photo_loss.lambda_p
+            scalar_dict['priority_warmup'] = priority_warmup
+        else:
+            raise NotImplementedError(f'Photometric loss mode "{method_args.photo_loss.mode}" is not implemented yet')
+
         loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
     
         # sky loss
@@ -251,6 +370,8 @@ def prepare_output_and_logger():
         viewer_arg['model_path']= cfg.model_path
         cfg_log_f.write(str(Namespace(**viewer_arg)))
 
+    prepare_wandb()
+
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
@@ -316,6 +437,9 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(cfg.train.detect_anomaly)
     training()
+
+    if WANDB_FOUND and wandb.run is not None:
+        wandb.finish()
 
     # All done
     print("\nTraining complete.")

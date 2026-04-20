@@ -569,19 +569,76 @@ class StreetGaussianModel(nn.Module):
             model.xyz_gradient_accum[visibility_model, 0:1] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, :2], dim=-1, keepdim=True)
             model.xyz_gradient_accum[visibility_model, 1:2] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, 2:], dim=-1, keepdim=True)
             model.denom[visibility_model] += 1
+
+    def _resolve_density_thresholds(self, model_name, model, max_grad, min_opacity):
+        density_args = cfg.method.density
+
+        if density_args.mode == 'baseline':
+            return None, None
+        if density_args.mode == 'gaussian':
+            raise NotImplementedError('Density mode "gaussian" is not implemented yet')
+        if density_args.mode != 'object':
+            raise NotImplementedError(f'Density mode "{density_args.mode}" is not implemented yet')
+
+        if model_name == 'background':
+            base_max_grad = cfg.optim.get('densify_grad_threshold_bkgd', max_grad)
+            densify_scale = density_args.bg_densify_scale
+            prune_scale = density_args.bg_prune_scale
+        elif model_name.startswith('obj_'):
+            if getattr(model, 'random_initialization', False) or getattr(model, 'deformable', False):
+                base_max_grad = max_grad
+            else:
+                base_max_grad = cfg.optim.get('densify_grad_threshold_obj', max_grad)
+            densify_scale = density_args.obj_densify_scale
+            prune_scale = density_args.obj_prune_scale
+        else:
+            base_max_grad = max_grad
+            densify_scale = 1.0
+            prune_scale = 1.0
+
+        return base_max_grad * densify_scale, min_opacity * prune_scale
         
     def densify_and_prune(self, max_grad, min_opacity, prune_big_points, exclude_list=[]):
         scalars = None
         tensors = None
+        density_args = cfg.method.density
+        points_total_background = 0
+        points_total_objects = 0
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
             model: GaussianModel = getattr(self, model_name)
 
-            scalars_, tensors_ = model.densify_and_prune(max_grad, min_opacity, prune_big_points)
+            if model_name == 'background':
+                points_total_background = model.get_xyz.shape[0]
+            elif model_name.startswith('obj_'):
+                points_total_objects += model.get_xyz.shape[0]
+
+            max_grad_override, min_opacity_override = self._resolve_density_thresholds(
+                model_name=model_name,
+                model=model,
+                max_grad=max_grad,
+                min_opacity=min_opacity,
+            )
+            scalars_, tensors_ = model.densify_and_prune(
+                max_grad,
+                min_opacity,
+                prune_big_points,
+                max_grad_override=max_grad_override,
+                min_opacity_override=min_opacity_override,
+            )
             if model_name == 'background':
                 scalars = scalars_
                 tensors = tensors_
+
+        if scalars is not None and density_args.mode == 'object':
+            scalars['density_mode_object'] = 1.0
+            scalars['density_obj_densify_scale'] = density_args.obj_densify_scale
+            scalars['density_obj_prune_scale'] = density_args.obj_prune_scale
+            scalars['density_bg_densify_scale'] = density_args.bg_densify_scale
+            scalars['density_bg_prune_scale'] = density_args.bg_prune_scale
+            scalars['points_total_background'] = points_total_background
+            scalars['points_total_objects'] = points_total_objects
     
         return scalars, tensors
     

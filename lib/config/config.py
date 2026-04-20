@@ -23,6 +23,16 @@ cfg.to_cuda = False # higher GPU utilization with larger memory required
 cfg.source_path = ''
 cfg.model_path = ''
 cfg.record_dir = None
+cfg.logging = CN()
+cfg.logging.wandb = CN()
+cfg.logging.wandb.enabled = False
+cfg.logging.wandb.project = 'street-gaussians'
+cfg.logging.wandb.entity = ''
+cfg.logging.wandb.name = ''
+cfg.logging.wandb.tags = []
+cfg.logging.wandb.mode = 'online' # choices: online, offline, disabled
+cfg.logging.wandb.sync_tensorboard = True
+cfg.logging.wandb.save_code = False
 cfg.resolution = -1
 cfg.resolution_scales = [1]
 
@@ -80,6 +90,37 @@ cfg.optim.lambda_color_correction = 0.
 cfg.optim.lambda_pose_correction = 0.
 cfg.optim.lambda_scale_flatten = 0.
 cfg.optim.lambda_opacity_sparse = 0.
+
+cfg.method = CN()
+cfg.method.priority = CN()
+cfg.method.priority.source = 'none' # choices: none, box, box_residual
+cfg.method.priority.dilate = 0
+cfg.method.priority.residual_lambda = 0.0 # reserved for future E
+cfg.method.priority.residual_ema = False # reserved for future E
+cfg.method.priority.residual_ema_decay = 0.9 # reserved for future E
+
+cfg.method.photo_loss = CN()
+cfg.method.photo_loss.mode = 'baseline' # choices: baseline, priority_l1
+cfg.method.photo_loss.lambda_p = 0.5
+cfg.method.photo_loss.warmup_start = 2000
+cfg.method.photo_loss.warmup_end = 8000
+
+cfg.method.sampler = CN()
+cfg.method.sampler.mode = 'uniform' # choices: uniform, priority_mix
+cfg.method.sampler.eta = 0.2
+cfg.method.sampler.score_type = 'box_area'
+
+cfg.method.density = CN()
+cfg.method.density.mode = 'baseline' # choices: baseline, object, gaussian
+cfg.method.density.obj_densify_scale = 1.0
+cfg.method.density.obj_prune_scale = 1.0
+cfg.method.density.bg_densify_scale = 1.0
+cfg.method.density.bg_prune_scale = 1.0
+cfg.method.density.alpha = 0.4 # reserved for future D2
+
+cfg.method.regularization = CN()
+cfg.method.regularization.bg_penalty_enabled = False # reserved for future F
+cfg.method.regularization.lambda_bg_penalty = 0.0
 
 
 cfg.model = CN()
@@ -156,4 +197,3 @@ parser.add_argument("opts", default=None, nargs=argparse.REMAINDER)
 
 args = parser.parse_args()
 cfg = make_cfg(cfg, args)
-
