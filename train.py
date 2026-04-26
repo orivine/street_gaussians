@@ -5,6 +5,7 @@ from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim, weighted_l1_loss
 from lib.utils.priority_utils import (
     build_priority_mask,
     build_camera_priority_scores,
+    build_residual_priority_mask,
     build_priority_weight_map,
     build_priority_sampling_probs,
     compute_priority_warmup,
@@ -79,6 +80,11 @@ def training():
     optim_args = cfg.optim
     data_args = cfg.data
     method_args = cfg.method
+    if method_args.priority.source == 'box_residual':
+        if method_args.priority.residual_ema:
+            raise NotImplementedError('Priority residual EMA is not implemented yet')
+        if method_args.priority.residual_norm != 'percentile':
+            raise NotImplementedError(f'Residual norm "{method_args.priority.residual_norm}" is not implemented yet')
 
     start_iter = 0
     tb_writer = prepare_output_and_logger()
@@ -122,6 +128,7 @@ def training():
             priority_source=method_args.priority.source,
             priority_dilate=method_args.priority.dilate,
             score_type=method_args.sampler.score_type,
+            score_source=method_args.sampler.score_source,
         )
         priority_sampler['probs'] = build_priority_sampling_probs(
             scores=priority_sampler['scores'],
@@ -168,24 +175,53 @@ def training():
             obj_bound = obj_bound.cuda(non_blocking=True) if not obj_bound.is_cuda else obj_bound
 
         priority_mask = None
+        box_priority_mask = None
         if method_args.priority.source != 'none' or method_args.photo_loss.mode == 'priority_l1':
+            priority_source = method_args.priority.source
+            if priority_source == 'box_residual':
+                priority_source = 'box'
             priority_mask = build_priority_mask(
                 obj_bound=obj_bound,
                 valid_mask=mask,
-                source=method_args.priority.source,
+                source=priority_source,
                 dilate=method_args.priority.dilate,
             )
+            if method_args.priority.source == 'box_residual':
+                box_priority_mask = priority_mask
         
             
         render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
         image, acc, viewspace_point_tensor, visibility_filter, radii = render_pkg["rgb"], render_pkg['acc'], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         depth = render_pkg['depth'] # [1, H, W]
 
+        residual_priority_stats = None
+        if method_args.priority.source == 'box_residual' and method_args.photo_loss.mode == 'priority_l1':
+            priority_mask, residual_priority_stats = build_residual_priority_mask(
+                image=image,
+                gt_image=gt_image,
+                valid_mask=mask,
+                box_mask=box_priority_mask,
+                residual_scope=method_args.priority.residual_scope,
+                residual_lambda=method_args.priority.residual_lambda,
+                residual_blend=method_args.priority.residual_blend,
+                residual_norm=method_args.priority.residual_norm,
+                residual_percentile=method_args.priority.residual_percentile,
+                return_stats=True,
+            )
+
         scalar_dict = dict()
         if priority_mask is not None:
             scalar_dict.update(summarize_priority_mask(priority_mask, mask))
             scalar_dict['priority_source_box'] = 1.0 if method_args.priority.source == 'box' else 0.0
+            scalar_dict['priority_source_box_residual'] = 1.0 if method_args.priority.source == 'box_residual' else 0.0
             scalar_dict['priority_dilate'] = float(method_args.priority.dilate)
+        if residual_priority_stats is not None:
+            scalar_dict.update(residual_priority_stats)
+            scalar_dict['residual_lambda'] = float(method_args.priority.residual_lambda)
+            scalar_dict['residual_blend'] = float(method_args.priority.residual_blend)
+            scalar_dict['residual_percentile'] = float(method_args.priority.residual_percentile)
+            scalar_dict['residual_scope_box'] = 1.0 if method_args.priority.residual_scope == 'box' else 0.0
+            scalar_dict['residual_scope_global'] = 1.0 if method_args.priority.residual_scope == 'global' else 0.0
         if method_args.photo_loss.mode == 'priority_l1':
             scalar_dict['photo_loss_priority_l1'] = 1.0
         if method_args.sampler.mode == 'priority_mix':

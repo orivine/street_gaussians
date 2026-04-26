@@ -95,8 +95,12 @@ cfg.method = CN()
 cfg.method.priority = CN()
 cfg.method.priority.source = 'none' # choices: none, box, box_residual
 cfg.method.priority.dilate = 0
-cfg.method.priority.residual_lambda = 0.0 # reserved for future E
-cfg.method.priority.residual_ema = False # reserved for future E
+cfg.method.priority.residual_scope = 'box' # choices: box, global
+cfg.method.priority.residual_lambda = 1.0
+cfg.method.priority.residual_blend = 0.5
+cfg.method.priority.residual_norm = 'percentile' # choices: percentile
+cfg.method.priority.residual_percentile = 0.95
+cfg.method.priority.residual_ema = False # reserved for future residual cache
 cfg.method.priority.residual_ema_decay = 0.9 # reserved for future E
 
 cfg.method.photo_loss = CN()
@@ -108,6 +112,7 @@ cfg.method.photo_loss.warmup_end = 8000
 cfg.method.sampler = CN()
 cfg.method.sampler.mode = 'uniform' # choices: uniform, priority_mix
 cfg.method.sampler.eta = 0.2
+cfg.method.sampler.score_source = 'box' # choices: box
 cfg.method.sampler.score_type = 'box_area'
 
 cfg.method.density = CN()

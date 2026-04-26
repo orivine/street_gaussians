@@ -3,7 +3,7 @@ source_path: ./data/waymo/validation/006
 exp_name: waymo_val_006
 
 to_cuda: true
-gpu: [0]
+gpus: [0]
 
 data:
   split_train: -1
@@ -76,7 +76,10 @@ method:
   priority:
     source: none          # none | box | box_residual
     dilate: 0
-    residual_lambda: 0.0
+    residual_scope: 'box' # choices: box, global
+    residual_lambda: 1.0
+    residual_blend: 0.5
+    residual_norm: 'percentile' # choices: percentile
     residual_ema: false
     residual_ema_decay: 0.9
 
@@ -90,6 +93,7 @@ method:
     mode: uniform   # uniform | priority_mix
     eta: 0.2
     score_type: box_area # box_area | box_mass | object_count
+    score_source: 'box' # choices: box
 
   density:
     mode: baseline         # baseline | object | gaussian
