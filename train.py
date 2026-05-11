@@ -80,6 +80,10 @@ def training():
     optim_args = cfg.optim
     data_args = cfg.data
     method_args = cfg.method
+    if method_args.motion.mode not in ['baseline', 'emd_pose_lite']:
+        raise NotImplementedError(f'Motion mode "{method_args.motion.mode}" is not implemented yet')
+    if method_args.motion.lambda_motion_smooth != 0.0:
+        raise NotImplementedError('Motion temporal smoothness is parsed but not implemented in Feature G v1')
     if method_args.priority.source == 'box_residual':
         if method_args.priority.residual_ema:
             raise NotImplementedError('Priority residual EMA is not implemented yet')
@@ -256,6 +260,11 @@ def training():
             raise NotImplementedError(f'Photometric loss mode "{method_args.photo_loss.mode}" is not implemented yet')
 
         loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
+
+        if method_args.motion.mode == 'emd_pose_lite':
+            motion_reg_loss, motion_stats = gaussians.motion_regularization_loss(return_stats=True)
+            scalar_dict.update(motion_stats)
+            loss += motion_reg_loss
     
         # sky loss
         if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:

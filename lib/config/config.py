@@ -127,6 +127,31 @@ cfg.method.regularization = CN()
 cfg.method.regularization.bg_penalty_enabled = False # reserved for future F
 cfg.method.regularization.lambda_bg_penalty = 0.0
 
+cfg.method.motion = CN()
+cfg.method.motion.mode = 'baseline' # choices: baseline, emd_pose_lite
+cfg.method.motion.time_encoding = 'learnable' # choices: learnable, fourier
+cfg.method.motion.temporal_embedding_dim = 4
+cfg.method.motion.min_embeddings = 30
+cfg.method.motion.max_embeddings = 150
+cfg.method.motion.c2f_temporal_iter = 25000
+cfg.method.motion.object_embedding_dim = 16
+cfg.method.motion.use_coarse_fine = True
+cfg.method.motion.hidden_dim = 64
+cfg.method.motion.num_layers = 2
+cfg.method.motion.activation = 'silu'
+cfg.method.motion.zero_init = True
+cfg.method.motion.delta_t_scale = 0.05
+cfg.method.motion.delta_r_scale = 0.03
+cfg.method.motion.warmup_start = 2000
+cfg.method.motion.warmup_end = 8000
+cfg.method.motion.lr_mlp = 0.0005
+cfg.method.motion.lr_embedding = 0.001
+cfg.method.motion.lambda_motion_reg_t = 0.001
+cfg.method.motion.lambda_motion_reg_r = 0.001
+cfg.method.motion.lambda_motion_smooth = 0.0
+cfg.method.motion.apply_to_val = True
+cfg.method.motion.fail_on_missing_track = False
+
 
 cfg.model = CN()
 cfg.model.gaussian = CN()

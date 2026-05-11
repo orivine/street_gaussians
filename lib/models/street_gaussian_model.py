@@ -22,6 +22,7 @@ from bidict import bidict
 from lib.utils.camera_utils import Camera
 from lib.utils.sh_utils import eval_sh
 from lib.models.actor_pose import ActorPose
+from lib.models.emd_pose_lite import EMDPoseLite
 from lib.models.sky_cubemap import SkyCubeMap
 from lib.models.color_correction import ColorCorrection
 from lib.models.camera_pose import PoseCorrection
@@ -59,6 +60,8 @@ class StreetGaussianModel(nn.Module):
         self.flip_matrix = torch.eye(3).float().cuda() * -1
         self.flip_matrix[self.flip_axis, self.flip_axis] = 1
         self.flip_matrix = matrix_to_quaternion(self.flip_matrix.unsqueeze(0))
+        self.current_iteration = None
+        self.loaded_iteration = None
         self.setup_functions() 
     
     def set_visibility(self, include_list):
@@ -117,6 +120,10 @@ class StreetGaussianModel(nn.Module):
         self.active_sh_degree = self.max_sh_degree
   
     def load_state_dict(self, state_dict, exclude_list=[]):
+        if 'iter' in state_dict:
+            self.loaded_iteration = int(state_dict['iter'])
+            self.current_iteration = int(state_dict['iter'])
+
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
@@ -134,6 +141,21 @@ class StreetGaussianModel(nn.Module):
             
         if self.pose_correction is not None:
             self.pose_correction.load_state_dict(state_dict['pose_correction'])
+
+        has_motion_state = 'emd_pose_lite' in state_dict
+        if self.motion_refiner is not None:
+            self.motion_refiner.set_loaded_iteration(self.loaded_iteration)
+            if has_motion_state:
+                self.motion_refiner.load_state_dict(
+                    state_dict['emd_pose_lite'],
+                    load_optimizer=(cfg.mode == 'train'),
+                )
+            elif cfg.mode == 'train':
+                print('Warning: checkpoint has no emd_pose_lite state; keeping zero-initialized motion refiner')
+            else:
+                raise KeyError('Checkpoint has no emd_pose_lite state but method.motion.mode is emd_pose_lite')
+        elif has_motion_state:
+            raise KeyError('Checkpoint contains emd_pose_lite state but method.motion.mode is baseline')
                             
     def save_state_dict(self, is_final, exclude_list=[]):
         state_dict = dict()
@@ -155,6 +177,9 @@ class StreetGaussianModel(nn.Module):
       
         if self.pose_correction is not None:
             state_dict['pose_correction'] = self.pose_correction.save_state_dict(is_final)
+
+        if self.motion_refiner is not None:
+            state_dict['emd_pose_lite'] = self.motion_refiner.save_state_dict(is_final)
       
         return state_dict
         
@@ -203,6 +228,14 @@ class StreetGaussianModel(nn.Module):
         else:
             self.actor_pose = None
 
+        motion_mode = cfg.method.motion.mode
+        if motion_mode not in ['baseline', 'emd_pose_lite']:
+            raise NotImplementedError(f'Motion mode "{motion_mode}" is not implemented yet')
+        if motion_mode == 'emd_pose_lite' and self.include_obj:
+            self.motion_refiner = EMDPoseLite(obj_info, tracklet_timestamps, cfg.method.motion)
+        else:
+            self.motion_refiner = None
+
         # Build color correction
         if self.use_color_correction:
             self.color_correction = ColorCorrection(self.metadata)
@@ -228,6 +261,9 @@ class StreetGaussianModel(nn.Module):
         self.frame_is_val = camera.meta['is_val']
         self.num_gaussians = 0
         self.graph_gaussian_range = dict()
+        self.obj_pose_cache = dict()
+        if self.motion_refiner is not None:
+            self.motion_refiner.clear_current_view()
         idx = 0
 
         # background        
@@ -258,7 +294,19 @@ class StreetGaussianModel(nn.Module):
                 obj_model: GaussianModelActor = getattr(self, obj_name)
                 track_id = obj_model.track_id
                 obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-                obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)                
+                obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)
+                if self.motion_refiner is not None:
+                    obj_rot, obj_trans, _ = self.motion_refiner.refine_pose(
+                        track_id=track_id,
+                        camera=self.viewpoint_camera,
+                        base_rot=obj_rot,
+                        base_trans=obj_trans,
+                        iteration=self.current_iteration,
+                    )
+                self.obj_pose_cache[int(track_id)] = {
+                    'rot_pre_ego': obj_rot,
+                    'trans_pre_ego': obj_trans,
+                }
                 ego_pose = self.viewpoint_camera.ego_pose
                 ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0)).squeeze(0)
                 obj_rot = quaternion_raw_multiply(ego_pose_rot.unsqueeze(0), obj_rot.unsqueeze(0)).squeeze(0)
@@ -468,8 +516,11 @@ class StreetGaussianModel(nn.Module):
             track_id = obj_model.track_id
 
             normals_obj_local = obj_model.get_normals(camera) # [N, 3]
-                    
-            obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
+
+            if self.motion_refiner is not None and int(track_id) in self.obj_pose_cache:
+                obj_rot = self.obj_pose_cache[int(track_id)]['rot_pre_ego']
+            else:
+                obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
             obj_rot = quaternion_to_matrix(obj_rot.unsqueeze(0)).squeeze(0)
             
             normals_obj_global = normals_obj_local @ obj_rot.T
@@ -500,6 +551,9 @@ class StreetGaussianModel(nn.Module):
                 
         if self.actor_pose is not None:
             self.actor_pose.training_setup()
+
+        if self.motion_refiner is not None:
+            self.motion_refiner.training_setup()
         
         if self.sky_cubemap is not None:
             self.sky_cubemap.training_setup()
@@ -511,6 +565,7 @@ class StreetGaussianModel(nn.Module):
             self.pose_correction.training_setup()
         
     def update_learning_rate(self, iteration, exclude_list=[]):
+        self.current_iteration = iteration
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
@@ -519,6 +574,9 @@ class StreetGaussianModel(nn.Module):
         
         if self.actor_pose is not None:
             self.actor_pose.update_learning_rate(iteration)
+
+        if self.motion_refiner is not None:
+            self.motion_refiner.update_learning_rate(iteration)
     
         if self.sky_cubemap is not None:
             self.sky_cubemap.update_learning_rate(iteration)
@@ -538,6 +596,9 @@ class StreetGaussianModel(nn.Module):
 
         if self.actor_pose is not None:
             self.actor_pose.update_optimizer()
+
+        if self.motion_refiner is not None:
+            self.motion_refiner.update_optimizer()
         
         if self.sky_cubemap is not None:
             self.sky_cubemap.update_optimizer()
@@ -547,6 +608,17 @@ class StreetGaussianModel(nn.Module):
             
         if self.pose_correction is not None:
             self.pose_correction.update_optimizer()
+
+    def motion_regularization_loss(self, return_stats=False):
+        if self.motion_refiner is None:
+            loss = torch.zeros((), dtype=torch.float32, device='cuda')
+            if return_stats:
+                return loss, {}
+            return loss
+        return self.motion_refiner.regularization_loss(
+            iteration=self.current_iteration,
+            return_stats=return_stats,
+        )
 
     def set_max_radii2D(self, radii, visibility_filter):
         radii = radii.float()
