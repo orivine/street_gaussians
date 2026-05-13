@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -13,7 +14,7 @@ def _cfg_get(cfg_node, key, default=None):
 
 
 class EMDPoseLite(nn.Module):
-    def __init__(self, obj_info, tracklet_timestamps, motion_cfg, device=None):
+    def __init__(self, obj_info, tracklet_timestamps, motion_cfg, device=None, tracklets=None):
         super().__init__()
         self.cfg = motion_cfg
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -53,15 +54,32 @@ class EMDPoseLite(nn.Module):
         self.track_ids = sorted(int(track_id) for track_id in obj_info.keys())
         self.track_id_to_index = {track_id: idx for idx, track_id in enumerate(self.track_ids)}
         self.track_time_bounds = {}
-        fallback_start = float(tracklet_timestamps[0]) if len(tracklet_timestamps) > 0 else 0.0
-        fallback_end = float(tracklet_timestamps[-1]) if len(tracklet_timestamps) > 0 else fallback_start + 1.0
+        self.track_time_bounds_source = {}
+        fallback_start, fallback_end = self._global_time_bounds(tracklet_timestamps)
+        fallback_track_ids = []
         for track_id in self.track_ids:
             obj_meta = obj_info[track_id]
-            start = float(obj_meta.get('start_timestamp', fallback_start))
-            end = float(obj_meta.get('end_timestamp', fallback_end))
-            if end <= start:
-                end = start + 1e-6
+            start, end, source = self._resolve_track_time_bounds(
+                track_id=track_id,
+                obj_meta=obj_meta,
+                tracklet_timestamps=tracklet_timestamps,
+                tracklets=tracklets,
+                fallback_start=fallback_start,
+                fallback_end=fallback_end,
+            )
             self.track_time_bounds[track_id] = (start, end)
+            self.track_time_bounds_source[track_id] = source
+            if source == 'global_fallback':
+                fallback_track_ids.append(track_id)
+
+        if len(fallback_track_ids) > 0:
+            warnings.warn(
+                'EMDPoseLite could not resolve object-local temporal bounds for '
+                f'{len(fallback_track_ids)} track(s); using global scene timestamp bounds. '
+                'This can weaken object-local temporal normalization.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         self.object_embedding = nn.Embedding(len(self.track_ids), self.object_embedding_dim)
         if self.time_encoding == 'learnable':
@@ -92,6 +110,136 @@ class EMDPoseLite(nn.Module):
         self.current_iteration = None
         self.clear_current_view()
         self.to(self.device)
+
+    @staticmethod
+    def _scalar(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            value = value.detach().cpu().reshape(-1)[0].item()
+        elif hasattr(value, 'item'):
+            value = value.item()
+        return value
+
+    @classmethod
+    def _float_scalar(cls, value):
+        value = cls._scalar(value)
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @classmethod
+    def _int_scalar(cls, value):
+        value = cls._float_scalar(value)
+        if value is None:
+            return None
+        rounded = int(round(value))
+        if abs(value - rounded) > 1e-6:
+            return None
+        return rounded
+
+    @classmethod
+    def _timestamp_at(cls, tracklet_timestamps, index):
+        try:
+            timestamp = tracklet_timestamps[index]
+        except (IndexError, TypeError, KeyError):
+            return None
+        return cls._float_scalar(timestamp)
+
+    @classmethod
+    def _timestamp_count(cls, tracklet_timestamps):
+        try:
+            return len(tracklet_timestamps)
+        except TypeError:
+            return 0
+
+    @classmethod
+    def _global_time_bounds(cls, tracklet_timestamps):
+        count = cls._timestamp_count(tracklet_timestamps)
+        if count == 0:
+            return 0.0, 1.0
+        start = cls._timestamp_at(tracklet_timestamps, 0)
+        end = cls._timestamp_at(tracklet_timestamps, count - 1)
+        if start is None:
+            start = 0.0
+        if end is None or end < start:
+            end = start
+        return start, end
+
+    @classmethod
+    def _bounds_from_metadata_timestamps(cls, obj_meta):
+        start = cls._float_scalar(obj_meta.get('start_timestamp'))
+        end = cls._float_scalar(obj_meta.get('end_timestamp'))
+        if start is None or end is None or end < start:
+            return None
+        return start, end, 'metadata_timestamps'
+
+    @classmethod
+    def _bounds_from_metadata_frames(cls, obj_meta, tracklet_timestamps):
+        start_frame = cls._int_scalar(obj_meta.get('start_frame'))
+        end_frame = cls._int_scalar(obj_meta.get('end_frame'))
+        timestamp_count = cls._timestamp_count(tracklet_timestamps)
+        if start_frame is None or end_frame is None or end_frame < start_frame:
+            return None
+        if start_frame < 0 or end_frame >= timestamp_count:
+            return None
+
+        start = cls._timestamp_at(tracklet_timestamps, start_frame)
+        end = cls._timestamp_at(tracklet_timestamps, end_frame)
+        if start is None or end is None or end < start:
+            return None
+        return start, end, 'metadata_frames'
+
+    @classmethod
+    def _bounds_from_tracklets(cls, track_id, tracklets, tracklet_timestamps):
+        if tracklets is None:
+            return None
+
+        tracklet_tensor = torch.as_tensor(tracklets)
+        if tracklet_tensor.ndim < 3 or tracklet_tensor.shape[-1] < 1:
+            return None
+
+        frame_mask = (tracklet_tensor[..., 0] == int(track_id)).any(dim=1)
+        frame_indices = torch.nonzero(frame_mask, as_tuple=False).reshape(-1)
+        if frame_indices.numel() == 0:
+            return None
+
+        start_idx = int(frame_indices.min().item())
+        end_idx = int(frame_indices.max().item())
+        start = cls._timestamp_at(tracklet_timestamps, start_idx)
+        end = cls._timestamp_at(tracklet_timestamps, end_idx)
+        if start is None or end is None or end < start:
+            return None
+        return start, end, 'tracklets'
+
+    @classmethod
+    def _resolve_track_time_bounds(
+        cls,
+        track_id,
+        obj_meta,
+        tracklet_timestamps,
+        tracklets,
+        fallback_start,
+        fallback_end,
+    ):
+        for resolver in (
+            lambda: cls._bounds_from_metadata_timestamps(obj_meta),
+            lambda: cls._bounds_from_metadata_frames(obj_meta, tracklet_timestamps),
+            lambda: cls._bounds_from_tracklets(track_id, tracklets, tracklet_timestamps),
+        ):
+            bounds = resolver()
+            if bounds is not None:
+                return bounds
+
+        return fallback_start, fallback_end, 'global_fallback'
 
     def _activation(self):
         if self.activation == 'silu':
@@ -213,7 +361,11 @@ class EMDPoseLite(nn.Module):
         track_id = int(track_id)
         timestamp = float(camera.meta['timestamp'])
         start, end = self.track_time_bounds[track_id]
-        tau = (timestamp - start) / max(end - start, 1e-6)
+        duration = end - start
+        if duration <= 1e-6:
+            tau = 0.0
+        else:
+            tau = (timestamp - start) / duration
         tau = min(max(tau, 0.0), 1.0)
         return torch.tensor([tau], dtype=torch.float32, device=self.device)
 

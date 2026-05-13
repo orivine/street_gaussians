@@ -232,7 +232,12 @@ class StreetGaussianModel(nn.Module):
         if motion_mode not in ['baseline', 'emd_pose_lite']:
             raise NotImplementedError(f'Motion mode "{motion_mode}" is not implemented yet')
         if motion_mode == 'emd_pose_lite' and self.include_obj:
-            self.motion_refiner = EMDPoseLite(obj_info, tracklet_timestamps, cfg.method.motion)
+            self.motion_refiner = EMDPoseLite(
+                obj_info,
+                tracklet_timestamps,
+                cfg.method.motion,
+                tracklets=obj_tracklets,
+            )
         else:
             self.motion_refiner = None
 
