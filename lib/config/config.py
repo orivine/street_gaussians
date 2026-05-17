@@ -109,6 +109,18 @@ cfg.method.photo_loss.lambda_p = 0.5
 cfg.method.photo_loss.warmup_start = 2000
 cfg.method.photo_loss.warmup_end = 8000
 
+cfg.method.object_zone = CN()
+cfg.method.object_zone.mode = 'disabled' # choices: disabled, box_l1_dssim
+cfg.method.object_zone.source = 'box' # choices: box, priority
+cfg.method.object_zone.lambda_zone = 0.05
+cfg.method.object_zone.lambda_l1 = 1.0
+cfg.method.object_zone.lambda_dssim = 0.2
+cfg.method.object_zone.warmup_start = 7000
+cfg.method.object_zone.warmup_end = 12000
+cfg.method.object_zone.min_area = 32
+cfg.method.object_zone.detach_zone_weight = True
+cfg.method.object_zone.use_crop_ssim = False
+
 cfg.method.sampler = CN()
 cfg.method.sampler.mode = 'uniform' # choices: uniform, priority_mix
 cfg.method.sampler.eta = 0.2

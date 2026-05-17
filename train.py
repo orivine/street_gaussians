@@ -13,6 +13,7 @@ from lib.utils.priority_utils import (
     sample_view_index,
     summarize_priority_mask,
 )
+from lib.utils.object_zone_loss_utils import compute_object_zone_loss
 from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
@@ -89,6 +90,15 @@ def training():
             raise NotImplementedError('Priority residual EMA is not implemented yet')
         if method_args.priority.residual_norm != 'percentile':
             raise NotImplementedError(f'Residual norm "{method_args.priority.residual_norm}" is not implemented yet')
+    if method_args.object_zone.mode not in ['disabled', 'box_l1_dssim']:
+        raise NotImplementedError(f'Object-zone mode "{method_args.object_zone.mode}" is not implemented yet')
+    if method_args.object_zone.mode != 'disabled':
+        if method_args.object_zone.source != 'box':
+            raise NotImplementedError(
+                f'Object-zone source "{method_args.object_zone.source}" is not implemented in Feature H v1'
+            )
+        if method_args.object_zone.use_crop_ssim:
+            raise NotImplementedError('Object-zone crop SSIM is not implemented in Feature H v1')
 
     start_iter = 0
     tb_writer = prepare_output_and_logger()
@@ -260,6 +270,28 @@ def training():
             raise NotImplementedError(f'Photometric loss mode "{method_args.photo_loss.mode}" is not implemented yet')
 
         loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
+
+        if method_args.object_zone.mode != 'disabled':
+            object_zone_loss, object_zone_stats = compute_object_zone_loss(
+                image=image,
+                gt_image=gt_image,
+                obj_bound=obj_bound,
+                valid_mask=mask,
+                iteration=iteration,
+                source=method_args.object_zone.source,
+                lambda_zone=method_args.object_zone.lambda_zone,
+                lambda_l1=method_args.object_zone.lambda_l1,
+                lambda_dssim=method_args.object_zone.lambda_dssim,
+                warmup_start=method_args.object_zone.warmup_start,
+                warmup_end=method_args.object_zone.warmup_end,
+                min_area=method_args.object_zone.min_area,
+                detach_zone_weight=method_args.object_zone.detach_zone_weight,
+                use_crop_ssim=method_args.object_zone.use_crop_ssim,
+                ssim_fn=ssim,
+                return_stats=True,
+            )
+            scalar_dict.update(object_zone_stats)
+            loss += object_zone_loss
 
         if method_args.motion.mode == 'emd_pose_lite':
             motion_reg_loss, motion_stats = gaussians.motion_regularization_loss(return_stats=True)
