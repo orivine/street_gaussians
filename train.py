@@ -81,6 +81,11 @@ def training():
     optim_args = cfg.optim
     data_args = cfg.data
     method_args = cfg.method
+    residual_targets = method_args.priority.get('residual_apply_to', 'b')
+    if residual_targets not in ['b', 'h', 'both']:
+        raise ValueError(
+            f'Priority residual_apply_to "{residual_targets}" is invalid; expected one of "b", "h", "both"'
+        )
     if method_args.motion.mode not in ['baseline', 'emd_pose_lite']:
         raise NotImplementedError(f'Motion mode "{method_args.motion.mode}" is not implemented yet')
     if method_args.motion.lambda_motion_smooth != 0.0:
@@ -93,12 +98,34 @@ def training():
     if method_args.object_zone.mode not in ['disabled', 'box_l1_dssim']:
         raise NotImplementedError(f'Object-zone mode "{method_args.object_zone.mode}" is not implemented yet')
     if method_args.object_zone.mode != 'disabled':
-        if method_args.object_zone.source != 'box':
+        if method_args.object_zone.source not in ['box', 'priority']:
             raise NotImplementedError(
-                f'Object-zone source "{method_args.object_zone.source}" is not implemented in Feature H v1'
+                f'Object-zone source "{method_args.object_zone.source}" is not implemented'
             )
         if method_args.object_zone.use_crop_ssim:
             raise NotImplementedError('Object-zone crop SSIM is not implemented in Feature H v1')
+    residual_for_b = (
+        method_args.priority.source == 'box_residual'
+        and method_args.photo_loss.mode == 'priority_l1'
+        and residual_targets in ['b', 'both']
+    )
+    residual_for_h = (
+        method_args.priority.source == 'box_residual'
+        and method_args.object_zone.mode != 'disabled'
+        and residual_targets in ['h', 'both']
+    )
+    need_residual_priority = residual_for_b or residual_for_h
+    if residual_for_h and method_args.object_zone.source != 'priority':
+        raise ValueError(
+            'method.priority.residual_apply_to includes "h", so method.object_zone.source must be "priority" '
+            'to apply residual priority to H L1'
+        )
+    if method_args.object_zone.mode != 'disabled' and method_args.object_zone.source == 'priority':
+        if not residual_for_h:
+            raise ValueError(
+                'Object-zone source "priority" requires method.priority.source "box_residual" '
+                'and method.priority.residual_apply_to in ["h", "both"]'
+            )
 
     start_iter = 0
     tb_writer = prepare_output_and_logger()
@@ -190,7 +217,8 @@ def training():
 
         priority_mask = None
         box_priority_mask = None
-        if method_args.priority.source != 'none' or method_args.photo_loss.mode == 'priority_l1':
+        residual_priority_mask = None
+        if method_args.priority.source != 'none' or method_args.photo_loss.mode == 'priority_l1' or need_residual_priority:
             priority_source = method_args.priority.source
             if priority_source == 'box_residual':
                 priority_source = 'box'
@@ -209,8 +237,8 @@ def training():
         depth = render_pkg['depth'] # [1, H, W]
 
         residual_priority_stats = None
-        if method_args.priority.source == 'box_residual' and method_args.photo_loss.mode == 'priority_l1':
-            priority_mask, residual_priority_stats = build_residual_priority_mask(
+        if need_residual_priority:
+            residual_priority_mask, residual_priority_stats = build_residual_priority_mask(
                 image=image,
                 gt_image=gt_image,
                 valid_mask=mask,
@@ -222,6 +250,8 @@ def training():
                 residual_percentile=method_args.priority.residual_percentile,
                 return_stats=True,
             )
+            if residual_for_b:
+                priority_mask = residual_priority_mask
 
         scalar_dict = dict()
         if priority_mask is not None:
@@ -229,6 +259,10 @@ def training():
             scalar_dict['priority_source_box'] = 1.0 if method_args.priority.source == 'box' else 0.0
             scalar_dict['priority_source_box_residual'] = 1.0 if method_args.priority.source == 'box_residual' else 0.0
             scalar_dict['priority_dilate'] = float(method_args.priority.dilate)
+            scalar_dict['residual_apply_to_b'] = 1.0 if residual_targets in ['b', 'both'] else 0.0
+            scalar_dict['residual_apply_to_h'] = 1.0 if residual_targets in ['h', 'both'] else 0.0
+            scalar_dict['residual_for_b'] = 1.0 if residual_for_b else 0.0
+            scalar_dict['residual_for_h'] = 1.0 if residual_for_h else 0.0
         if residual_priority_stats is not None:
             scalar_dict.update(residual_priority_stats)
             scalar_dict['residual_lambda'] = float(method_args.priority.residual_lambda)
@@ -279,6 +313,7 @@ def training():
                 valid_mask=mask,
                 iteration=iteration,
                 source=method_args.object_zone.source,
+                zone_weight=residual_priority_mask if residual_for_h else None,
                 lambda_zone=method_args.object_zone.lambda_zone,
                 lambda_l1=method_args.object_zone.lambda_l1,
                 lambda_dssim=method_args.object_zone.lambda_dssim,

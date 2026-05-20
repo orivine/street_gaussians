@@ -102,6 +102,7 @@ cfg.method.priority.residual_norm = 'percentile' # choices: percentile
 cfg.method.priority.residual_percentile = 0.95
 cfg.method.priority.residual_ema = False # reserved for future residual cache
 cfg.method.priority.residual_ema_decay = 0.9 # reserved for future E
+cfg.method.priority.residual_apply_to = 'b' # choices: b, h, both
 
 cfg.method.photo_loss = CN()
 cfg.method.photo_loss.mode = 'baseline' # choices: baseline, priority_l1

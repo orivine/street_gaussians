@@ -17,6 +17,16 @@ def _ensure_mask_shape(mask, name):
     return mask.bool()
 
 
+def _ensure_weight_shape(weight, name):
+    if weight is None:
+        return None
+    if weight.ndim == 2:
+        weight = weight.unsqueeze(0)
+    if weight.ndim != 3:
+        raise ValueError(f'Expected {name} with shape [1, H, W] or [H, W], got {tuple(weight.shape)}')
+    return weight.float()
+
+
 def compute_object_zone_warmup(iteration, warmup_start, warmup_end):
     if iteration < warmup_start:
         return 0.0
@@ -46,7 +56,7 @@ def build_object_zone_mask(obj_bound, valid_mask, min_area=32):
     return torch.logical_and(obj_bound, valid_mask)
 
 
-def object_zone_l1_loss(image, gt_image, zone_mask, detach_zone_weight=True, eps=1e-6):
+def object_zone_l1_loss(image, gt_image, zone_mask, zone_weight=None, detach_zone_weight=True, eps=1e-6):
     image = _ensure_image_shape(image, 'image')
     gt_image = _ensure_image_shape(gt_image, 'gt_image')
     zone_mask = _ensure_mask_shape(zone_mask, 'zone_mask')
@@ -58,19 +68,42 @@ def object_zone_l1_loss(image, gt_image, zone_mask, detach_zone_weight=True, eps
             f'image spatial shape {tuple(image.shape[-2:])} does not match zone_mask shape {tuple(zone_mask.shape[-2:])}'
         )
 
-    zone_weight = zone_mask.float()
-    if detach_zone_weight:
-        zone_weight = zone_weight.detach()
+    if zone_weight is None:
+        l1_weight = zone_mask.float()
+    else:
+        zone_weight = _ensure_weight_shape(zone_weight, 'zone_weight')
+        if zone_weight.shape != zone_mask.shape:
+            raise ValueError(
+                f'zone_weight shape {tuple(zone_weight.shape)} does not match zone_mask shape {tuple(zone_mask.shape)}'
+            )
+        if not torch.isfinite(zone_weight).all():
+            raise ValueError('zone_weight contains non-finite values')
+        if (zone_weight < 0.0).any().item():
+            raise ValueError('zone_weight must be non-negative')
+        l1_weight = zone_weight * zone_mask.float()
 
-    zone_area = zone_weight.sum()
-    if zone_area.item() <= 0.0:
+    if detach_zone_weight:
+        l1_weight = l1_weight.detach()
+
+    zone_mass = l1_weight.sum()
+    if zone_mass.item() <= 0.0:
         return image.new_zeros(())
 
     pixel_l1 = torch.abs(image - gt_image).mean(dim=0, keepdim=True)
-    return (pixel_l1 * zone_weight).sum() / (zone_area + float(eps))
+    return (pixel_l1 * l1_weight).sum() / (zone_mass + float(eps))
 
 
-def _zero_object_zone_stats(image, warmup, zone_area, valid_area, lambda_zone):
+def _zero_object_zone_stats(
+    image,
+    warmup,
+    zone_area,
+    valid_area,
+    lambda_zone,
+    source_priority=False,
+    priority_area=0.0,
+    priority_mass=0.0,
+    l1_uses_priority=False,
+):
     zone_area_value = float(zone_area)
     valid_area_value = float(valid_area)
     return image.new_zeros(()), {
@@ -82,6 +115,10 @@ def _zero_object_zone_stats(image, warmup, zone_area, valid_area, lambda_zone):
         'object_zone_ratio': zone_area_value / valid_area_value if valid_area_value > 0.0 else 0.0,
         'object_zone_lambda': float(lambda_zone),
         'object_zone_enabled': 1.0,
+        'object_zone_source_priority': 1.0 if source_priority else 0.0,
+        'object_zone_priority_area': float(priority_area),
+        'object_zone_priority_mass': float(priority_mass),
+        'object_zone_l1_uses_priority': 1.0 if l1_uses_priority else 0.0,
     }
 
 
@@ -92,6 +129,7 @@ def compute_object_zone_loss(
     valid_mask,
     iteration,
     source='box',
+    zone_weight=None,
     lambda_zone=0.05,
     lambda_l1=1.0,
     lambda_dssim=0.2,
@@ -116,8 +154,10 @@ def compute_object_zone_loss(
         raise ValueError(
             f'image spatial shape {tuple(image.shape[-2:])} does not match valid_mask shape {tuple(valid_mask.shape[-2:])}'
         )
-    if source != 'box':
-        raise NotImplementedError(f'Object-zone source "{source}" is not implemented in Feature H v1')
+    if source not in ['box', 'priority']:
+        raise NotImplementedError(f'Object-zone source "{source}" is not implemented')
+    if source == 'priority' and zone_weight is None:
+        raise ValueError('Object-zone source "priority" requires zone_weight for L1 weighting')
     if use_crop_ssim:
         raise NotImplementedError('Object-zone crop SSIM is not implemented in Feature H v1')
     if float(lambda_zone) < 0.0:
@@ -131,10 +171,55 @@ def compute_object_zone_loss(
     zone_mask = build_object_zone_mask(obj_bound=obj_bound, valid_mask=valid_mask, min_area=min_area)
     zone_area = float(zone_mask.sum().item())
     valid_area = float(valid_mask.sum().item())
+    source_priority = source == 'priority'
+    l1_weight = None
+    priority_area = 0.0
+    priority_mass = 0.0
+
+    if source_priority:
+        l1_weight = _ensure_weight_shape(zone_weight, 'zone_weight')
+        if l1_weight.shape != zone_mask.shape:
+            raise ValueError(
+                f'zone_weight shape {tuple(l1_weight.shape)} does not match object-zone shape {tuple(zone_mask.shape)}'
+            )
+        if not torch.isfinite(l1_weight).all():
+            raise ValueError('zone_weight contains non-finite values')
+        if (l1_weight < 0.0).any().item():
+            raise ValueError('zone_weight must be non-negative')
+        l1_weight = l1_weight * zone_mask.float()
+        if detach_zone_weight:
+            l1_weight = l1_weight.detach()
+        priority_area = float((l1_weight > float(eps)).sum().item())
+        priority_mass = float(l1_weight.sum().detach().item())
 
     if zone_area <= 0.0 or zone_area < float(min_area):
         if return_stats:
-            return _zero_object_zone_stats(image, warmup, zone_area, valid_area, lambda_zone)
+            return _zero_object_zone_stats(
+                image,
+                warmup,
+                zone_area,
+                valid_area,
+                lambda_zone,
+                source_priority=source_priority,
+                priority_area=priority_area,
+                priority_mass=priority_mass,
+                l1_uses_priority=source_priority,
+            )
+        return image.new_zeros(())
+
+    if source_priority and priority_mass <= float(eps):
+        if return_stats:
+            return _zero_object_zone_stats(
+                image,
+                warmup,
+                zone_area,
+                valid_area,
+                lambda_zone,
+                source_priority=True,
+                priority_area=priority_area,
+                priority_mass=priority_mass,
+                l1_uses_priority=True,
+            )
         return image.new_zeros(())
 
     l1_loss = image.new_zeros(())
@@ -143,6 +228,7 @@ def compute_object_zone_loss(
             image=image,
             gt_image=gt_image,
             zone_mask=zone_mask,
+            zone_weight=l1_weight,
             detach_zone_weight=detach_zone_weight,
             eps=eps,
         )
@@ -172,4 +258,8 @@ def compute_object_zone_loss(
         'object_zone_ratio': zone_area / valid_area if valid_area > 0.0 else 0.0,
         'object_zone_lambda': float(lambda_zone),
         'object_zone_enabled': 1.0,
+        'object_zone_source_priority': 1.0 if source_priority else 0.0,
+        'object_zone_priority_area': priority_area,
+        'object_zone_priority_mass': priority_mass,
+        'object_zone_l1_uses_priority': 1.0 if source_priority else 0.0,
     }
